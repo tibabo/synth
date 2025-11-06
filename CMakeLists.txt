@@ -33,6 +33,9 @@ project(synth C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+add_subdirectory(pico_audio_i2s_32b/src/pico_audio_32b pico_audio_32b)
+add_subdirectory(pico_audio_i2s_32b pico_audio_i2s_32b)
+
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(synth synth.c )
@@ -46,7 +49,8 @@ pico_enable_stdio_usb(synth 1)
 
 # Add the standard library to the build
 target_link_libraries(synth
-        pico_stdlib)
+    pico_stdlib
+)
 
 # Add the standard include files to the build
 target_include_directories(synth PRIVATE
@@ -55,8 +59,16 @@ target_include_directories(synth PRIVATE
 
 # Add any user requested libraries
 target_link_libraries(synth 
-        hardware_dma
-        )
+    hardware_dma
+    pico_audio_32b
+    pico_audio_i2s_32b
+)
+
+# target_compile_definitions(${PROJECT_NAME} PRIVATE
+#    PICO_AUDIO_I2S_PIO=1
+#    PICO_AUDIO_I2S_DMA_IRQ=1
+#    CORE1_PROCESS_I2S_CALLBACK
+# )
 
 pico_add_extra_outputs(synth)
 
