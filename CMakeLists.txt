@@ -27,6 +27,9 @@ set(PICO_BOARD pico2 CACHE STRING "Board type")
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
+# We also need PICO EXTRAS
+set(PICO_EXTRAS_FETCH_FROM_GIT ON CACHE BOOL "Set to ON to fetch copy of PICO EXTRAS from git if not otherwise locatable")
+include(pico_extras_import.cmake)
 
 project(synth C CXX ASM)
 
