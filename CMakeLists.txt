@@ -41,7 +41,7 @@ add_subdirectory(pico_audio_i2s_32b pico_audio_i2s_32b)
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(synth synth.c )
+add_executable(synth synth.cpp )
 
 pico_set_program_name(synth "synth")
 pico_set_program_version(synth "0.1")
