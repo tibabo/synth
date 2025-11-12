@@ -53,6 +53,7 @@ pico_enable_stdio_usb(synth 1)
 # Add the standard library to the build
 target_link_libraries(synth
     pico_stdlib
+    hardware_adc
 )
 
 # Add the standard include files to the build
