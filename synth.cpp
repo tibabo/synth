@@ -6,6 +6,28 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
+#include <assert.h>
+
+// Prototypes explicites pour calmer l'analyseur si les includes ne sont pas résolus
+extern "C" int printf(const char *format, ...);
+extern "C" int puts(const char *s);
+extern "C" void free(void *ptr);
+extern "C" float powf(float, float);
+extern "C" float cosf(float);
+extern "C" float fabsf(float);
+
+// Assurer disponibilité des fonctions/f constantes math si certains define manquent
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+
+#if !defined(__cplusplus)
+#error Ce fichier nécessite un compilateur C++ pour les surcharges.
+#endif
 
 #include "hardware/pll.h"
 #include "hardware/clocks.h"
@@ -84,14 +106,103 @@ const char* note_names[NOTES_PER_OCTAVE] = {
     "LA", "LA#", "SI", "DO", "DO#", "RE", "RE#", "MI", "FA", "FA#", "SOL", "SOL#"
 };
 
-uint32_t step0 = 0x146A81;  // LA 440 Hz (valeur expérimentale)  
-uint32_t step1 = 0x146A81;  // LA 440 Hz (valeur expérimentale)
-int freq_index0 = 24;  // Index 24 = LA4 (440 Hz) - milieu de la gamme
-int freq_index1 = 24;  // Index 24 = LA4 (440 Hz) - milieu de la gamme
-uint32_t pos0 = 0;
-uint32_t pos1 = 0;
+// -------- Polyphonie 8 voix --------
+static const int MAX_VOICES = 8;
+uint32_t steps[MAX_VOICES];          // pas d'incrément pour chaque voix
+int freq_index[MAX_VOICES];          // index de note pour chaque voix
+uint32_t positions[MAX_VOICES];      // position phase dans la table pour chaque voix
 const uint32_t pos_max = 0x10000 * SINE_WAVE_TABLE_LEN;
-uint vol = 20;
+uint vol = 30;                       // volume global simple
+int current_voice = 0;               // voix sélectionnée pour les commandes clavier
+// Gain de sortie ajustable (post-mix). Permet de compenser la suppression de <<8.
+static int output_gain_shift = 6;    // valeur raisonnable (2^6 = 64). Ancien code utilisait 256 (<<8).
+
+// ---------------- Envelope (Attack / Release) ----------------
+// Attack et Release en millisecondes (modifiables via clavier)
+static uint32_t attack_ms = 20;     // temps d'attaque par défaut
+static uint32_t release_ms = 200;   // temps de relâchement par défaut
+
+enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_SUSTAIN, ENV_RELEASE };
+struct Envelope {
+    EnvState state;
+    uint32_t pos;            // position dans la phase courante (samples)
+    uint32_t attack_samples; // durée d'attaque en samples
+    uint32_t release_samples;// durée de release en samples
+    uint32_t level;          // niveau courant 0..65536
+};
+
+static Envelope env[MAX_VOICES] { {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0}, {ENV_IDLE,0,0,0,0} };
+
+// Facteur de courbure logarithmique (>1) : plus grand => attaque plus douce au début
+static float curve_factor = 9.0f; // utilisée dans log(1 + t*curve_factor)/log(1+curve_factor)
+static bool use_log_curve = true; // permet d'activer/désactiver le lissage log
+
+static inline void envelope_recalc(Envelope &e) {
+    e.attack_samples  = (attack_ms  * audio_format.sample_freq) / 1000;
+    e.release_samples = (release_ms * audio_format.sample_freq) / 1000;
+    if (e.state == ENV_ATTACK && e.attack_samples == 0) {
+        e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0;
+    }
+    if (e.state == ENV_RELEASE && e.release_samples == 0) {
+        e.level = 0; e.state = ENV_IDLE; e.pos = 0;
+    }
+}
+
+static inline void envelope_recalc_all() { for(int v=0; v<MAX_VOICES; ++v) envelope_recalc(env[v]); }
+
+static inline void envelope_trigger_attack(Envelope &e) {
+    e.state = ENV_ATTACK; e.pos = 0; if (e.attack_samples == 0) { e.level = 65536; e.state = ENV_SUSTAIN; }
+}
+static inline void envelope_trigger_release(Envelope &e) {
+    if (e.state == ENV_IDLE) return; 
+    // Impose une longueur minimale pour éviter coupure abrupte (click)
+    const uint32_t MIN_RELEASE_SAMPLES = 128; // ~2.9ms
+    if (e.release_samples < MIN_RELEASE_SAMPLES) e.release_samples = MIN_RELEASE_SAMPLES;
+    e.state = ENV_RELEASE; e.pos = 0; if (e.release_samples == 0) { e.level = 0; e.state = ENV_IDLE; }
+}
+
+static inline void envelope_step(Envelope &e) {
+    switch (e.state) {
+        case ENV_IDLE: e.level = 0; break;
+        case ENV_ATTACK:
+            if (e.attack_samples == 0) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0; break; }
+            if (e.pos >= e.attack_samples) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0; break; }
+            if (use_log_curve) {
+                float t = (float)e.pos / (float)e.attack_samples; // 0..1
+                // Approximation rationnelle douce (évite logf/powf coûteux):
+                // shaped = t / (t + k*(1-t)) où k lié à curve_factor
+                float k = curve_factor; // >1 rend début plus lent
+                float denom = t + k * (1.0f - t);
+                float shaped = (denom > 0.0f) ? (t / denom) : t; // 0..1
+                e.level = (uint32_t)(shaped * 65536.0f);
+            } else {
+                e.level = (uint64_t)65536 * e.pos / e.attack_samples; // linéaire
+            }
+            ++e.pos;
+            break;
+        case ENV_SUSTAIN:
+            e.level = 65536;
+            break;
+        case ENV_RELEASE:
+            if (e.release_samples == 0) { e.level = 0; e.state = ENV_IDLE; e.pos = 0; break; }
+            if (e.pos >= e.release_samples) { e.level = 0; e.state = ENV_IDLE; e.pos = 0; break; }
+            if (use_log_curve) {
+                float t = (float)e.pos / (float)e.release_samples; // 0..1
+                float k = curve_factor;
+                // Utiliser même forme mais inversée: attackShape(t) = t/(t+k*(1-t)); release = 1 - attackShape(t)
+                float denom = t + k * (1.0f - t);
+                float base = (denom > 0.0f) ? (t / denom) : t;
+                float shaped = 1.0f - base;
+                e.level = (uint32_t)(shaped * 65536.0f);
+            } else {
+                e.level = (uint64_t)65536 * ( (uint64_t)(e.release_samples - e.pos) ) / e.release_samples; // linéaire
+            }
+            ++e.pos;
+            break;
+    }
+}
+
+// --------------------------------------------------------------
 
 #if 0
 audio_buffer_pool_t *init_audio() {
@@ -212,20 +323,20 @@ void i2s_audio_deinit()
     audio_buffer_t* ab;
     ab = take_audio_buffer(ap, false);
     while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
+    free(ab->buffer->bytes);
+    free(ab->buffer);
         ab = take_audio_buffer(ap, false);
     }
     ab = get_free_audio_buffer(ap, false);
     while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
+    free(ab->buffer->bytes);
+    free(ab->buffer);
         ab = get_free_audio_buffer(ap, false);
     }
     ab = get_full_audio_buffer(ap, false);
     while (ab != nullptr) {
-        free(ab->buffer->bytes);
-        free(ab->buffer);
+    free(ab->buffer->bytes);
+    free(ab->buffer);
         ab = get_full_audio_buffer(ap, false);
     }
     free(ap);
@@ -239,7 +350,7 @@ audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
     audio_buffer_pool_t *producer_pool = audio_new_producer_pool(&producer_format, 3, SAMPLES_PER_BUFFER);
     ap = producer_pool;
 
-    bool __unused ok;
+    bool ok;
     const audio_format_t *output_format;
 
     output_format = audio_i2s_setup(&audio_format, &audio_format, &i2s_config);
@@ -316,8 +427,11 @@ int main() {
 
     //2048 samples 
     
+    #ifndef M_PI
+    #define M_PI 3.14159265358979323846
+    #endif
     for (int i = 0; i < SINE_WAVE_TABLE_LEN; i++) {
-        sine_wave_table[i] = 32767 * cosf(i * 2 * (float) (M_PI / SINE_WAVE_TABLE_LEN));
+    sine_wave_table[i] = 32767 * cosf(i * 2 * (float) (M_PI / SINE_WAVE_TABLE_LEN));
     }
 
     // Initialisation du tableau des fréquences musicales (gamme tempérée)
@@ -329,104 +443,124 @@ int main() {
         // Calcul de la fréquence pour cette note (gamme tempérée égale)
         // LA4 (440Hz) est à l'index 24, donc décalage de -24
         float semitone_offset = (float)(i - 24);  // Offset par rapport au LA4 (440Hz)
-        float frequency = 440.0f * powf(2.0f, semitone_offset / 12.0f);
+    float frequency = 440.0f * powf(2.0f, semitone_offset / 12.0f);
         
         // Conversion en valeur step
         frequency_table[i] = (uint32_t)((frequency * 0x10000 * SINE_WAVE_TABLE_LEN) / 44100.0f);
     }
 
     ap = i2s_audio_init(44100);
+    envelope_recalc_all();
+    // Init des voix (LA4)
+    for(int v=0; v<MAX_VOICES; ++v){
+        freq_index[v] = 24; // LA4
+        steps[v] = frequency_table[freq_index[v]];
+        positions[v] = 0;
+        env[v].state = ENV_IDLE; env[v].level = 0; env[v].pos = 0;
+    }
 
     int time = 0;
     while (true) {
-        int c = getchar_timeout_us(100000);
+        int c = getchar_timeout_us(0);
         if (c >= 0 && c != PICO_ERROR_TIMEOUT) {
             if (c == '-' && vol) vol--;
             if ((c == '=' || c == '+') && vol < 256) vol++;
             
-            // Contrôles fins (anciens)
-            if (c == '[' && step0 > 0x10000) step0 -= 0x10000;
-            if (c == ']' && step0 < (SINE_WAVE_TABLE_LEN / 16) * 0x20000) step0 += 0x10000;
-            if (c == '{' && step1 > 0x10000) step1 -= 0x10000;
-            if (c == '}' && step1 < (SINE_WAVE_TABLE_LEN / 16) * 0x20000) step1 += 0x10000;
+
             
             // Nouveaux contrôles avec le tableau de fréquences
-            if (c == 'a' && freq_index0 > 0) {
-                freq_index0--;
-                step0 = get_frequency_step(freq_index0);
+            // Sélection de la voix active par chiffres 1..8
+            if (c >= '1' && c <= '8') {
+                current_voice = c - '1';
             }
-            if (c == 's' && freq_index0 < FREQUENCY_TABLE_LEN - 1) {
-                freq_index0++;
-                step0 = get_frequency_step(freq_index0);
+            // Changement de note sur voix sélectionnée
+            if (c == 'a' && freq_index[current_voice] > 0) {
+                freq_index[current_voice]--;
+                steps[current_voice] = get_frequency_step(freq_index[current_voice]);
+                envelope_trigger_attack(env[current_voice]);
             }
-            if (c == 'z' && freq_index1 > 0) {
-                freq_index1--;
-                step1 = get_frequency_step(freq_index1);
-            }
-            if (c == 'x' && freq_index1 < FREQUENCY_TABLE_LEN - 1) {
-                freq_index1++;
-                step1 = get_frequency_step(freq_index1);
+            if (c == 's' && freq_index[current_voice] < FREQUENCY_TABLE_LEN - 1) {
+                freq_index[current_voice]++;
+                steps[current_voice] = get_frequency_step(freq_index[current_voice]);
+                envelope_trigger_attack(env[current_voice]);
             }
             
             // Saut d'octave (12 demi-tons = une octave)
-            if (c == 'A' && freq_index0 >= NOTES_PER_OCTAVE) {
-                freq_index0 -= NOTES_PER_OCTAVE;  // -1 octave
-                step0 = get_frequency_step(freq_index0);
+            if (c == 'A' && freq_index[current_voice] >= NOTES_PER_OCTAVE) {
+                freq_index[current_voice] -= NOTES_PER_OCTAVE;  // -1 octave
+                steps[current_voice] = get_frequency_step(freq_index[current_voice]);
+                envelope_trigger_attack(env[current_voice]);
             }
-            if (c == 'S' && freq_index0 < FREQUENCY_TABLE_LEN - NOTES_PER_OCTAVE) {
-                freq_index0 += NOTES_PER_OCTAVE;  // +1 octave
-                step0 = get_frequency_step(freq_index0);
+            if (c == 'S' && freq_index[current_voice] < FREQUENCY_TABLE_LEN - NOTES_PER_OCTAVE) {
+                freq_index[current_voice] += NOTES_PER_OCTAVE;  // +1 octave
+                steps[current_voice] = get_frequency_step(freq_index[current_voice]);
+                envelope_trigger_attack(env[current_voice]);
             }
-            if (c == 'Z' && freq_index1 >= NOTES_PER_OCTAVE) {
-                freq_index1 -= NOTES_PER_OCTAVE;  // -1 octave canal droit
-                step1 = get_frequency_step(freq_index1);
-            }
-            if (c == 'X' && freq_index1 < FREQUENCY_TABLE_LEN - NOTES_PER_OCTAVE) {
-                freq_index1 += NOTES_PER_OCTAVE;  // +1 octave canal droit
-                step1 = get_frequency_step(freq_index1);
-            }
+
+            // Déclencheurs Attack/Release explicites
+            if (c == 'p') { envelope_trigger_attack(env[current_voice]); }
+            if (c == 'o') { envelope_trigger_release(env[current_voice]); }
+
+            // Réglages Attack / Release
+            if (c == 't' && attack_ms > 0) { attack_ms -= (attack_ms > 10 ? 10 : 1); envelope_recalc_all(); }
+            if (c == 'T' && attack_ms < 5000) { attack_ms += (attack_ms >= 1000 ? 100 : 10); envelope_recalc_all(); }
+            if (c == 'r' && release_ms > 0) { release_ms -= (release_ms > 10 ? 10 : 1); envelope_recalc_all(); }
+            if (c == 'R' && release_ms < 10000) { release_ms += (release_ms >= 1000 ? 100 : 10); envelope_recalc_all(); }
+
+            // Réglage du facteur de courbure (logarithmique). Plus grand => attaque/release plus longue au début.
+            if (c == 'f' && curve_factor > 1.1f) { curve_factor -= 0.5f; }
+            if (c == 'F' && curve_factor < 50.0f) { curve_factor += 0.5f; }
+            if (c == 'l') { use_log_curve = !use_log_curve; }
+            // Ajustement du gain global de sortie (post-mix) : g diminue, G augmente
+            if (c == 'g' && output_gain_shift > 0) { output_gain_shift--; }
+            if (c == 'G' && output_gain_shift < 12) { output_gain_shift++; }
             
             if (c == 'q') break;
             
             // Affichage des notes avec noms
-            int octave0, octave1;
-            const char* note0 = get_note_name(freq_index0, &octave0);
-            const char* note1 = get_note_name(freq_index1, &octave1);
-            
-            printf("vol=%d, L:%s%d(%d) R:%s%d(%d)    \r", 
-                   static_cast<int>(vol), 
-                   note0, octave0, static_cast<int>(step0 >> 16),
-                   note1, octave1, static_cast<int>(step1 >> 16));
+         int octave0;
+         const char* note0 = get_note_name(freq_index[current_voice], &octave0);
+         // Compter voix actives
+         int active_cnt = 0; for(int v=0; v<MAX_VOICES; ++v) if (env[v].state != ENV_IDLE) ++active_cnt;
+         printf("V%d vol=%d act=%d atk=%ums rel=%ums curve=%.1f log=%d gainShift=%d NOTE:%s%d env=%d      \r",
+             current_voice+1,
+             (int)vol,
+             active_cnt,
+             (unsigned)attack_ms,
+             (unsigned)release_ms,
+             curve_factor,
+             use_log_curve ? 1 : 0,
+             output_gain_shift,
+             note0, octave0, (int)env[current_voice].state);
         } else {
-            int pushed_button = -1;
-            for (int i = 0; i < 8; i++) {
-                if (gpio_get(buttons_pins[i]) == 0) { // Bouton appuyé (logique inversée avec pull-up)
-                    pushed_button = i;
-                    printf("button %d\n", pushed_button);
-                    break;
+            static uint8_t prev_btn[8] = {1,1,1,1,1,1,1,1};
+            for(int i=0;i<8;i++) {
+                int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
+                if(state == 0 && prev_btn[i] == 1) {
+                    // press
+                    envelope_trigger_attack(env[i]);
+                } else if (state == 1 && prev_btn[i] == 0) {
+                    // release
+                    envelope_trigger_release(env[i]);
                 }
+                prev_btn[i] = state;
+
             }
-            for(int i = 0; i < 8; i++) {
-                gpio_put(leds_pins[i], 0);
-            }
-            if (pushed_button >= 0) {
-                time = pushed_button;
+            for(int i=0;i<8;i++) {
+                gpio_put(leds_pins[i], false); // éteint toutes les LEDs
             }
 
-            gpio_put(leds_pins[time], 1);
-            
+            gpio_put(leds_pins[time], true); // LED on si voix active
             sleep_ms(10);
-
-            uint start = _millis();
-            uint now = start;
-            while (now - start < 200) {
+            // // uint now = start;
+            // while (now - start < 200) {
                 adc_select_input(0); // TONE_GPIO
                 uint tone = adc_read();
-                //printf("Tone ADC: %d\n", tone);
-                freq_index0 = get_frequency_index((tone / 4095.0f) * 1000.0f + 400); // 0-1000Hz
-                step0 = get_frequency_step(freq_index0);
-                now = _millis();
-            }
+                printf("Tone %d ADC: %d\n", time, tone);
+                freq_index[time] = get_frequency_index(((3600 - tone) / 3600.0f) * 1000.0f); // 0-1000Hz
+                steps[time] = get_frequency_step(freq_index[time]);
+                // now = _millis();
+            // }
         }
         time++;
         if(time == 8) {
@@ -443,15 +577,41 @@ void decode()
     if (buffer == NULL) { return; }
     int32_t *samples = (int32_t *) buffer->buffer->bytes;
     for (uint i = 0; i < buffer->max_sample_count; i++) {
-        int32_t value0 = (vol * sine_wave_table[pos0 >> 16u]) << 8u;
-        int32_t value1 = (vol * sine_wave_table[pos1 >> 16u]) << 8u;
-        // use 32bit full scale
-        samples[i*2+0] = value0 + (value0 >> 16u);  // L
-        samples[i*2+1] = value1 + (value1 >> 16u);  // R
-        pos0 += step0;
-        pos1 += step1;
-        if (pos0 >= pos_max) pos0 -= pos_max;
-        if (pos1 >= pos_max) pos1 -= pos_max;
+    // Avancement envelope par sample
+        int64_t mix = 0;
+        int active = 0;
+        for(int v=0; v<MAX_VOICES; ++v) {
+            envelope_step(env[v]);
+            if (env[v].state != ENV_IDLE) ++active;
+            uint32_t p = positions[v];
+            // Retirer le décalage <<8 plus tard pour éviter overflow, garder headroom
+            int32_t raw = (vol * sine_wave_table[p >> 16u]); // ~ +/- vol*32767
+            int32_t env_scaled = (int32_t)(((int64_t)raw * env[v].level) >> 16); // applique enveloppe
+            mix += env_scaled;
+            positions[v] += steps[v];
+            if (positions[v] >= pos_max) positions[v] -= pos_max;
+        }
+        // Suppression du scaling dépendant du nombre de voix pour éviter le saut de gain lors du passage 2->1
+        // Soft clip rapide (compression) pour éviter saturation dure
+        // Limites approximatives pour conserver dynamique
+        const int32_t CLIP_THRESH = 0x3FFFFFFF; // marge sous INT32_MAX
+        int32_t value = (int32_t)mix; // déjà en plage 32-bit
+        if (value > CLIP_THRESH) {
+            int64_t x = value;
+            // approximation douce: compresser au-delà du seuil
+            value = (int32_t)(CLIP_THRESH + (x - CLIP_THRESH)/8); // compresse 8:1 la portion excédentaire
+        } else if (value < -CLIP_THRESH) {
+            int64_t x = value;
+            value = (int32_t)(-CLIP_THRESH + (x + CLIP_THRESH)/8);
+        }
+        // Application du gain de sortie ajustable
+        int64_t scaled = ((int64_t)value) << output_gain_shift;
+        // Saturation pour éviter overflow int32
+        if (scaled > INT32_MAX) scaled = INT32_MAX;
+        if (scaled < INT32_MIN) scaled = INT32_MIN;
+        int32_t out = (int32_t)scaled;
+        samples[i*2+0] = out;
+        samples[i*2+1] = out; // copie stéréo
     }
     buffer->sample_count = buffer->max_sample_count;
     give_audio_buffer(ap, buffer);
