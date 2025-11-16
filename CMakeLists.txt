@@ -43,6 +43,16 @@ add_subdirectory(pico_audio_i2s_32b pico_audio_i2s_32b)
 
 add_executable(synth synth.cpp )
 
+# Force higher optimization for this target (allow override by user build type)
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "Debug build: leaving default optimization flags")
+else()
+    # Ensure -O3 for both C and C++ for non-Debug builds
+    target_compile_options(synth PRIVATE $<$<COMPILE_LANGUAGE:C>:-O3> $<$<COMPILE_LANGUAGE:CXX>:-O3>)
+    # Recommend using -ffast-math only if user accepts some FP precision loss; leave commented
+    # target_compile_options(synth PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
+endif()
+
 pico_set_program_name(synth "synth")
 pico_set_program_version(synth "0.1")
 

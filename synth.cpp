@@ -65,7 +65,7 @@ const uint BUTTON5_PIN = 6;
 const uint BUTTON6_PIN = 7;
 const uint BUTTON7_PIN = 8;
 uint buttons_pins[8] = {BUTTON0_PIN, BUTTON1_PIN, BUTTON2_PIN, BUTTON3_PIN, BUTTON4_PIN, BUTTON5_PIN, BUTTON6_PIN, BUTTON7_PIN};
-
+uint adc_mean[8] = {0,0,0,0,0,0,0,0};
 const uint TONE_GPIO = 27; // GPIO pour l'entrée ADC
 const uint VOL_GPIO = 26; // GPIO pour l'entrée ADC
 
@@ -101,6 +101,8 @@ static int16_t sine_wave_table[SINE_WAVE_TABLE_LEN];
 // Tableau des valeurs de step pour les notes musicales (4 octaves × 12 demi-tons = 48 notes)
 // Index 0 = LA1 (110 Hz), Index 24 = LA4 (440 Hz), Index 47 = SOL#4 (831 Hz)
 uint32_t frequency_table[FREQUENCY_TABLE_LEN];
+// Per-note gain compensation (Q16 fixed) to boost low frequencies for perceived loudness
+uint32_t frequency_gain_q16[FREQUENCY_TABLE_LEN];
 
 // Noms des notes (12 demi-tons)
 const char* note_names[NOTES_PER_OCTAVE] = {
@@ -133,8 +135,10 @@ struct Envelope {
 struct Voice {
     uint32_t step() 
     {
-        return frequency_table[base_freq_index[button_id]];
+        freq_index = base_freq_index[button_id];
+        return frequency_table[freq_index];
     }
+    uint32_t freq_index;
     uint32_t position;
     int button_id; // 0..7 si déclenché par bouton, -1 si via clavier
     Envelope env;
@@ -171,7 +175,7 @@ static void start_voice(int button_id) {
             active_voices.erase(active_voices.begin()); // fallback: retirer la plus ancienne
         }
     }
-    Voice v; v.position = 0; v.button_id = button_id;
+    Voice v; v.freq_index = base_freq_index[button_id]; v.position = 0; v.button_id = button_id;
     v.env.state = ENV_ATTACK; v.env.pos = 0; v.env.level = 0; envelope_recalc(v.env);
     active_voices.push_back(v);
 }
@@ -483,8 +487,20 @@ int main() {
         frequency_table[i] = (uint32_t)((frequency * 0x10000 * SINE_WAVE_TABLE_LEN) / 44100.0f);
     }
 
-    ap = i2s_audio_init(44100);
+    // Précompute un gain pour compenser la sensibilité humaine (boost des graves)
+    // gain = (440 / freq) ^ alpha  where alpha ~ 0.28 gives moderate boost
+    const float ref = 440.0f;
+    const float alpha = 0.28f;
+    for (int i = 0; i < FREQUENCY_TABLE_LEN; ++i) {
+        float freq = (frequency_table[i] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
+        float gain = powf(ref / freq, alpha);
+        if (gain < 0.5f) gain = 0.5f;
+        if (gain > 3.0f) gain = 3.0f;
+        frequency_gain_q16[i] = (uint32_t)(gain * 65536.0f + 0.5f);
+    }
 
+    ap = i2s_audio_init(44100);
+        adc_select_input(0); // TONE_GPIO
     int time = 0;
     while (true) {
         int c = getchar_timeout_us(0);
@@ -550,17 +566,21 @@ int main() {
 
             }
             for(int i=0;i<8;i++) {
-                gpio_put(leds_pins[i], false); // éteint toutes les LEDs
+                gpio_set_function(leds_pins[i], GPIO_FUNC_NULL);
+                // Also disable digital pulls and digital receiver
+                // gpio_set_dir(leds_pins[i], GPIO_IN);
             }
-
+            gpio_set_function(leds_pins[time], GPIO_FUNC_SIO);
+            gpio_set_dir(leds_pins[time], GPIO_OUT);
             gpio_put(leds_pins[time], true); // LED on si voix active
             sleep_us(10000);
             // // uint now = start;
             // while (now - start < 200) {
-                adc_select_input(0); // TONE_GPIO
-                uint tone = adc_read();
-                printf("Tone %d ADC: %d\n", time, tone);
-                base_freq_index[time] = get_frequency_index(((3600 - tone) / 3600.0f) * 1000.0f); // 0-1000Hz
+                adc_mean[time] = adc_read();
+                adc_mean[time] = adc_read();
+                adc_mean[time] = adc_read();
+                if(time == 0)printf("Tone %d ADC: %04d\n", time, adc_mean[time]);
+                base_freq_index[time] = get_frequency_index(((3600 - adc_mean[time]) / 3600.0f) * 1000.0f); // 0-1000Hz
                 // now = _millis();
             // }
         }
@@ -590,7 +610,10 @@ void decode()
             }
             uint32_t p = v.position;
             int32_t raw = (vol * sine_wave_table[p >> 16u]);
-            int32_t env_scaled = (int32_t)(((int64_t)raw * v.env.level) >> 16);
+            // Appliquer compensation de gain par note (Q16)
+            uint32_t gq16 = frequency_gain_q16[v.freq_index];
+            int32_t raw_g = (int32_t)(((int64_t)raw * gq16) >> 16);
+            int32_t env_scaled = (int32_t)(((int64_t)raw_g * v.env.level) >> 16);
             mix += env_scaled;
             v.position += v.step();
             if (v.position >= pos_max) v.position -= pos_max;
