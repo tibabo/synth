@@ -40,7 +40,7 @@ extern "C" float fabsf(float);
 #include "pico/audio_i2s.h"
 
 #define SINE_WAVE_TABLE_LEN 2048
-#define OCTAVES_COUNT 4             // Nombre d'octaves
+#define OCTAVES_COUNT 2             // Nombre d'octaves
 #define NOTES_PER_OCTAVE 12         // 12 demi-tons par octave
 #define FREQUENCY_TABLE_LEN (OCTAVES_COUNT * NOTES_PER_OCTAVE)  // 48 notes au total
 #define SAMPLES_PER_BUFFER 1156 // Samples / channel
@@ -65,7 +65,7 @@ const uint BUTTON5_PIN = 6;
 const uint BUTTON6_PIN = 7;
 const uint BUTTON7_PIN = 8;
 uint buttons_pins[8] = {BUTTON0_PIN, BUTTON1_PIN, BUTTON2_PIN, BUTTON3_PIN, BUTTON4_PIN, BUTTON5_PIN, BUTTON6_PIN, BUTTON7_PIN};
-uint adc_mean[8] = {0,0,0,0,0,0,0,0};
+uint adc_mean[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 const uint TONE_GPIO = 27; // GPIO pour l'entrée ADC
 const uint VOL_GPIO = 26; // GPIO pour l'entrée ADC
 
@@ -129,6 +129,7 @@ struct Envelope {
     uint32_t attack_samples; // durée d'attaque en samples
     uint32_t release_samples;// durée de release en samples
     uint32_t level;          // niveau courant 0..65536
+    uint32_t release_start_level; // niveau de départ pour la phase de release
 };
 
 // Collection dynamique de voix (remplace le tableau env[])
@@ -149,6 +150,11 @@ static std::vector<Voice> active_voices; // voix actives
 static float curve_factor = 9.0f; // utilisée dans log(1 + t*curve_factor)/log(1+curve_factor)
 static bool use_log_curve = true; // permet d'activer/désactiver le lissage log
 
+static inline uint32_t _millis(void)
+{
+	return to_ms_since_boot(get_absolute_time());
+}
+
 static inline void envelope_recalc(Envelope &e) {
     e.attack_samples  = (attack_ms  * audio_format.sample_freq) / 1000;
     e.release_samples = (release_ms * audio_format.sample_freq) / 1000;
@@ -158,6 +164,10 @@ static inline void envelope_recalc(Envelope &e) {
     if (e.state == ENV_RELEASE && e.release_samples == 0) {
         e.level = 0; e.state = ENV_IDLE; e.pos = 0;
     }
+}
+
+float logmap(float x, float min, float max) {
+    return min * powf(max / min, x);   // x in [0,1] maps to [min,max] loga   
 }
 
 static inline void envelope_recalc_all() { for(auto &v : active_voices) envelope_recalc(v.env); }
@@ -188,6 +198,7 @@ static inline void envelope_trigger_release(Envelope &e) {
     // Impose une longueur minimale pour éviter coupure abrupte (click)
     const uint32_t MIN_RELEASE_SAMPLES = 128; // ~2.9ms
     if (e.release_samples < MIN_RELEASE_SAMPLES) e.release_samples = MIN_RELEASE_SAMPLES;
+    e.release_start_level = e.level; // mémorise le niveau atteint (attaque potentiellement incomplète)
     e.state = ENV_RELEASE; e.pos = 0; if (e.release_samples == 0) { e.level = 0; e.state = ENV_IDLE; }
 }
 
@@ -199,12 +210,15 @@ static void release_voices_for_button(int button_id) {
     }
 }
 
+auto start_time = 0;
+
 static inline void envelope_step(Envelope &e) {
     switch (e.state) {
         case ENV_IDLE: e.level = 0; break;
         case ENV_ATTACK:
             if (e.attack_samples == 0) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0; break; }
-            if (e.pos >= e.attack_samples) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0; break; }
+            if (e.pos >= e.attack_samples) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0;
+                printf("Attack complete %u\n",_millis() - start_time); break; }
             if (use_log_curve) {
                 float t = (float)e.pos / (float)e.attack_samples; // 0..1
                 // Approximation rationnelle douce (évite logf/powf coûteux):
@@ -231,9 +245,9 @@ static inline void envelope_step(Envelope &e) {
                 float denom = t + k * (1.0f - t);
                 float base = (denom > 0.0f) ? (t / denom) : t;
                 float shaped = 1.0f - base;
-                e.level = (uint32_t)(shaped * 65536.0f);
+                e.level = (uint32_t)(shaped * (float)e.release_start_level);
             } else {
-                e.level = (uint64_t)65536 * ( (uint64_t)(e.release_samples - e.pos) ) / e.release_samples; // linéaire
+                e.level = (uint64_t)e.release_start_level * ( (uint64_t)(e.release_samples - e.pos) ) / e.release_samples; // linéaire depuis niveau courant
             }
             ++e.pos;
             break;
@@ -309,10 +323,7 @@ audio_buffer_pool_t *init_audio() {
 #endif
 
 
-static inline uint32_t _millis(void)
-{
-	return to_ms_since_boot(get_absolute_time());
-}
+
 
 // Fonction pour obtenir la valeur step à partir d'un index (0 à FREQUENCY_TABLE_LEN-1)
 uint32_t get_frequency_step(int index) {
@@ -500,7 +511,7 @@ int main() {
     }
 
     ap = i2s_audio_init(44100);
-        adc_select_input(0); // TONE_GPIO
+    adc_select_input(0); // TONE_GPIO
     int time = 0;
     while (true) {
         int c = getchar_timeout_us(0);
@@ -558,6 +569,7 @@ int main() {
                 if(state == 0 && prev_btn[i] == 1) {
                     // nouvelle voix sur ce bouton (superposition autorisée)
                     start_voice(i);
+                    start_time = _millis();
                 } else if (state == 1 && prev_btn[i] == 0) {
                     // relâche toutes les voix de ce bouton
                     release_voices_for_button(i);
@@ -576,12 +588,22 @@ int main() {
             sleep_us(10000);
             // // uint now = start;
             // while (now - start < 200) {
+                adc_select_input(0); // TONE_GPIO
                 adc_mean[time] = adc_read();
-                adc_mean[time] = adc_read();
-                adc_mean[time] = adc_read();
-                if(time == 0)printf("Tone %d ADC: %04d\n", time, adc_mean[time]);
-                base_freq_index[time] = get_frequency_index(((3600 - adc_mean[time]) / 3600.0f) * 1000.0f); // 0-1000Hz
+                adc_mean[time] = (adc_mean[time] *5 + adc_read()) / 6; 
+                adc_select_input(1); // VOL_GPIO
+                adc_mean[time + 8] = adc_read(); 
+                adc_mean[time + 8] = (adc_mean[time + 8] *5 + adc_read()) / 6; 
+                uint index = (uint)(((3600 - adc_mean[time]) / 3600.0f) * (FREQUENCY_TABLE_LEN -1) );
+                //if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
+                float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
+                base_freq_index[time] = get_frequency_index(freq);
                 // now = _millis();
+                if(time == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / 4095.0f), 1.0f, 5000.0f); envelope_recalc_all(); }
+                if(time == 9 - 8) { release_ms = logmap((adc_mean[9] / 4095.0f), 1.0f, 10000.0f);  envelope_recalc_all(); }
+                //if(time == 0)printf("Attack: %d ms, Release: %d ms\n", (unsigned)attack_ms, (unsigned)release_ms);
+                
+
             // }
         }
         time++;
