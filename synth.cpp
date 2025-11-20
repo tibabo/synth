@@ -71,6 +71,8 @@ const uint VOL_GPIO = 26; // GPIO pour l'entrée ADC
 
 static const uint32_t PIN_DCDC_PSM_CTRL = 23;
 
+uint analog_select_pins[4] = {28,27,10,11};
+
 audio_buffer_pool_t *ap;
 static bool decode_flg = false;
 static constexpr int32_t DAC_ZERO = 1;
@@ -425,6 +427,36 @@ audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
     return producer_pool;
 }
 
+uint16_t adc_read(int button) {
+    static int buttonToAnalogPin[16] = {
+//pitch pot
+        14, // GPIO26 -> ADC0
+        0, // GPIO27 -> ADC1
+        2, // GPIO28 -> ADC2
+        4, // GPIO29 -> ADC3
+        6,  // ADC4 (internal)
+        8,  // ADC5 (internal)
+        10,  // ADC6 (internal)
+        12,  // ADC7 (internal)
+// tunning pot
+        15,  // ADC8 (internal)
+        1,  // ADC9 (internal)
+        3,  // ADC10 (internal)
+        5,  // ADC11 (internal)
+        7,  // ADC12 (internal)
+        9,  // ADC13 (internal)
+        11, // ADC14 (internal)
+        13  // ADC15 (internal)
+    };
+    uint pin = buttonToAnalogPin[button];
+    gpio_put(analog_select_pins[0], pin & 0x01);
+    gpio_put(analog_select_pins[1], pin & 0x02);
+    gpio_put(analog_select_pins[2], pin & 0x04);
+    gpio_put(analog_select_pins[3], pin & 0x08);
+    sleep_us(100);
+    return adc_read();
+}
+
 int main() {
 
     stdio_init_all();
@@ -464,9 +496,13 @@ int main() {
         gpio_pull_up(buttons_pins[i]);
     }
 
-    adc_gpio_init(TONE_GPIO);
-    adc_gpio_init(VOL_GPIO);
+    for (int i = 0; i < 4; i++) {
+        gpio_init(analog_select_pins[i]);
+        gpio_set_dir(analog_select_pins[i], GPIO_OUT);
+    }
 
+    adc_gpio_init(TONE_GPIO);
+    adc_select_input(0);
     // DCDC PSM control
     // 0: PFM mode (best efficiency)
     // 1: PWM mode (improved ripple)
@@ -491,8 +527,8 @@ int main() {
     for (int i = 0; i < FREQUENCY_TABLE_LEN; i++) {
         // Calcul de la fréquence pour cette note (gamme tempérée égale)
         // LA4 (440Hz) est à l'index 24, donc décalage de -24
-        float semitone_offset = (float)(i - 24);  // Offset par rapport au LA4 (440Hz)
-    float frequency = 440.0f * powf(2.0f, semitone_offset / 12.0f);
+        float semitone_offset = (float)(i - 12);  // Offset par rapport au LA4 (440Hz)
+        float frequency = 440.0f * powf(2.0f, semitone_offset / 12.0f);
         
         // Conversion en valeur step
         frequency_table[i] = (uint32_t)((frequency * 0x10000 * SINE_WAVE_TABLE_LEN) / 44100.0f);
@@ -569,33 +605,29 @@ int main() {
                 if(state == 0 && prev_btn[i] == 1) {
                     // nouvelle voix sur ce bouton (superposition autorisée)
                     start_voice(i);
+                    gpio_put(leds_pins[i], true);
                     start_time = _millis();
+                    printf("Button %d pressed, starting voice at %u ms\n", i, start_time);
                 } else if (state == 1 && prev_btn[i] == 0) {
                     // relâche toutes les voix de ce bouton
                     release_voices_for_button(i);
+                    gpio_put(leds_pins[i], false);
                 }
                 prev_btn[i] = state;
 
             }
-            for(int i=0;i<8;i++) {
-                gpio_set_function(leds_pins[i], GPIO_FUNC_NULL);
-                // Also disable digital pulls and digital receiver
-                // gpio_set_dir(leds_pins[i], GPIO_IN);
-            }
-            gpio_set_function(leds_pins[time], GPIO_FUNC_SIO);
-            gpio_set_dir(leds_pins[time], GPIO_OUT);
-            gpio_put(leds_pins[time], true); // LED on si voix active
-            sleep_us(10000);
+          
+
             // // uint now = start;
             // while (now - start < 200) {
-                adc_select_input(0); // TONE_GPIO
-                adc_mean[time] = adc_read();
-                adc_mean[time] = (adc_mean[time] *5 + adc_read()) / 6; 
-                adc_select_input(1); // VOL_GPIO
-                adc_mean[time + 8] = adc_read(); 
-                adc_mean[time + 8] = (adc_mean[time + 8] *5 + adc_read()) / 6; 
+                // time = 0;
+
+                adc_mean[time] = adc_read(time);
+                adc_mean[time] = adc_read(time); 
+                adc_mean[time + 8] = adc_read(time + 8);
+                adc_mean[time + 8] = adc_read(time + 8);
                 uint index = (uint)(((3600 - adc_mean[time]) / 3600.0f) * (FREQUENCY_TABLE_LEN -1) );
-                //if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
+                if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
                 float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
                 base_freq_index[time] = get_frequency_index(freq);
                 // now = _millis();
