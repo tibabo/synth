@@ -222,6 +222,16 @@ static void release_voices_for_button(int button_id) {
     }
 }
 
+static int voices_for_button(int button_id) {
+    int i = 0;
+    for (auto &v : active_voices) {
+        if (v.button_id == button_id && v.env.state != ENV_IDLE) {
+            i++;
+        }
+    }
+    return i;
+}
+
 auto start_time = 0;
 
 static inline void envelope_step(Envelope &e) {
@@ -263,7 +273,7 @@ static inline void envelope_step(Envelope &e) {
             ++e.pos;
             break;
         case ENV_SUSTAIN:
-            if (e.pos >= e.sustain_samples) { e.state = ENV_RELEASE; e.pos = 0; break; }
+            if (e.pos >= e.sustain_samples) { e.state = ENV_RELEASE; e.pos = 0; e.release_start_level = e.level; break; }
             ++e.pos;
             break;
         case ENV_RELEASE:
@@ -577,7 +587,8 @@ int main() {
 
     ap = i2s_audio_init(44100);
     adc_select_input(0); // TONE_GPIO
-    int time = 0;
+    int scan_index = 0;
+    int sequence_pause_ms = 0;
     while (true) {
         int c = getchar_timeout_us(0);
         if (c >= 0 && c != PICO_ERROR_TIMEOUT) {
@@ -637,8 +648,11 @@ int main() {
              note0, octave0);
         } else {
             static uint8_t prev_btn[8] = {1,1,1,1,1,1,1,1};
+            bool any_button_active = false;
+
             for(int i=0;i<8;i++) {
                 int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
+                any_button_active |= (state == 0);
                 if(state == 0 && prev_btn[i] == 1) {
                     // nouvelle voix sur ce bouton (superposition autorisée)
                     start_voice(i);
@@ -651,47 +665,56 @@ int main() {
                     gpio_put(leds_pins[i], false);
                 }
                 prev_btn[i] = state;
-
+                int active_voices_count = voices_for_button(i);
+                if (active_voices_count > 0) {
+                    gpio_put(leds_pins[i], true);
+                } else {
+                    gpio_put(leds_pins[i], false);
+                }
             }
-          
+            if(any_button_active == true) {
+                sequence_pause_ms = 1000;
+                last_note_change = _millis();
+            }
 
                 // time = 0;
-                sleep_ms(10);
-                adc_mean[time] = adc_read(time);
-                adc_mean[time] = adc_read(time); 
-                adc_mean[time + 8] = adc_read(time + 8);
-                adc_mean[time + 8] = adc_read(time + 8);
-                uint index = (uint)(((3600 - adc_mean[time]) / 3600.0f) * (FREQUENCY_TABLE_LEN -1) );
-                // if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
-                float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
-                base_freq_index[time] = get_frequency_index(freq);
-                // now = _millis();
-                if(time == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / 4095.0f), 1.0f, 5000.0f);  }
-                if(time == 9 - 8) { decay_ms   = logmap((adc_mean[9] / 4095.0f),  1.0f, 3000.0f);   }
-                if(time == 10 - 8) { sustain_level = (uint32_t)logmap((adc_mean[10] / 4095.0f), 500.0f, 65536.0f);  }
-                if(time == 11 - 8) { sustain_ms = logmap((adc_mean[11] / 4095.0f),  1.0f, 3000.0f);   }
-                if(time == 12 - 8) { release_ms = logmap((adc_mean[12] / 4095.0f), 1.0f, 10000.0f);   }
-                if(time == 13 - 8) { speed_tuning = adc_mean[13]/10; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning; }
+            sleep_ms(10);
+            adc_mean[scan_index] = adc_read(scan_index);
+            adc_mean[scan_index] = adc_read(scan_index); 
+            adc_mean[scan_index + 8] = adc_read(scan_index + 8);
+            adc_mean[scan_index + 8] = adc_read(scan_index + 8);
+            uint index = (uint)(((3600 - adc_mean[scan_index]) / 3600.0f) * (FREQUENCY_TABLE_LEN -1) );
+            // if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
+            float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
+            base_freq_index[scan_index] = get_frequency_index(freq);
+            // now = _millis();
+            float max_level = 3600.f;
+            if(scan_index == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / max_level), 20.0f, 1000.0f);  }
+            if(scan_index == 9 - 8) { decay_ms   = logmap((adc_mean[9] / max_level),  20.0f, 300.0f);   }
+            if(scan_index == 10 - 8) { sustain_level = (uint32_t)logmap((adc_mean[10] / max_level), 500.0f, 65536.0f);  }
+            if(scan_index == 11 - 8) { sustain_ms = logmap((adc_mean[11] / max_level),  20.0f, 500.0f);   }
+            if(scan_index == 12 - 8) { release_ms = logmap((adc_mean[12] / max_level), 20.0f, 1000.0f);   }
+            if(scan_index == 13 - 8) { speed_tuning = (max_level - adc_mean[13])/5; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning > 700 ? 3000000 : speed_tuning; }
 
-                if(time == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms speed_tuning : %d \n",
-                    (unsigned)attack_ms,
-                    (unsigned)decay_ms,
-                    (unsigned)sustain_level,
-                    (unsigned)sustain_ms,
-                    (unsigned)release_ms,
-                    speed_tuning); }
+            if(scan_index == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms speed_tuning : %d \n",
+                (unsigned)attack_ms,
+                (unsigned)decay_ms,
+                (unsigned)sustain_level,
+                (unsigned)sustain_ms,
+                (unsigned)release_ms,
+                speed_tuning); }
         }
-        time++;
-        if(time == 8) {
-            time = 0;
+        scan_index++;
+        if(scan_index == 8) {
+            scan_index = 0;
         }
 
-        if(last_note_change + speed_tuning < _millis()) {
-            gpio_put(leds_pins[sequence++], false);
-            if(sequence >= 8) sequence = 0;
+        if(last_note_change + speed_tuning  + sequence_pause_ms < _millis()) {
             last_note_change = _millis();
             start_voice(sequence);
-            gpio_put(leds_pins[sequence], true);
+            sequence_pause_ms = 0;
+            sequence++;
+            if(sequence >= 8) sequence = 0;
         }
         // if(last_note_change + attack_ms + decay_ms + sustain_ms < _millis()) {
         //     gpio_put(leds_pins[sequence], false);
