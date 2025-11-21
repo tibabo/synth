@@ -112,7 +112,7 @@ const char* note_names[NOTES_PER_OCTAVE] = {
 };
 
 // -------- Polyphonie dynamique --------
-static const int MAX_VOICES = 16; // capacité simultanée maximale
+static const int MAX_VOICES = 7; // capacité simultanée maximale
 const uint32_t pos_max = 0x10000 * SINE_WAVE_TABLE_LEN;
 uint vol = 30;                       // volume global simple
 int current_button = 0;              // bouton sélectionné pour réglages
@@ -123,6 +123,8 @@ int base_freq_index[8] = {24,24,24,24,24,24,24,24}; // note de base par bouton
 // Attack et Release en millisecondes (modifiables via clavier)
 static uint32_t attack_ms = 20;     // temps d'attaque par défaut
 static uint32_t release_ms = 200;   // temps de relâchement par défaut
+static uint32_t speed_tuning = 500; // temps entre 2 notes
+static uint32_t sequence = 0; // index de la note en cours dans la sequence
 
 enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_SUSTAIN, ENV_RELEASE };
 struct Envelope {
@@ -430,23 +432,23 @@ audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq)
 uint16_t adc_read(int button) {
     static int buttonToAnalogPin[16] = {
 //pitch pot
-        14, // GPIO26 -> ADC0
-        0, // GPIO27 -> ADC1
-        2, // GPIO28 -> ADC2
-        4, // GPIO29 -> ADC3
-        6,  // ADC4 (internal)
-        8,  // ADC5 (internal)
-        10,  // ADC6 (internal)
-        12,  // ADC7 (internal)
+        14,
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
 // tunning pot
-        15,  // ADC8 (internal)
-        1,  // ADC9 (internal)
-        3,  // ADC10 (internal)
-        5,  // ADC11 (internal)
-        7,  // ADC12 (internal)
-        9,  // ADC13 (internal)
-        11, // ADC14 (internal)
-        13  // ADC15 (internal)
+        15,
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13
     };
     uint pin = buttonToAnalogPin[button];
     gpio_put(analog_select_pins[0], pin & 0x01);
@@ -501,7 +503,7 @@ int main() {
         gpio_set_dir(analog_select_pins[i], GPIO_OUT);
     }
 
-    adc_gpio_init(TONE_GPIO);
+    adc_gpio_init(26);
     adc_select_input(0);
     // DCDC PSM control
     // 0: PFM mode (best efficiency)
@@ -516,9 +518,9 @@ int main() {
     #define M_PI 3.14159265358979323846
     #endif
     for (int i = 0; i < SINE_WAVE_TABLE_LEN; i++) {
-    sine_wave_table[i] = 32767 * cosf(i * 2 * (float) (M_PI / SINE_WAVE_TABLE_LEN));
+        sine_wave_table[i] = 32767 * cosf(i * 2 * (float) (M_PI / SINE_WAVE_TABLE_LEN));
     }
-
+    int last_note_change = _millis();
     // Initialisation du tableau des fréquences musicales (gamme tempérée)
     // 4 octaves × 12 demi-tons = 48 notes de LA1 (110Hz) à SOL#4 (831Hz)
     // Formule: freq = 440 * 2^((note_index - 24) / 12)
@@ -618,8 +620,6 @@ int main() {
             }
           
 
-            // // uint now = start;
-            // while (now - start < 200) {
                 // time = 0;
 
                 adc_mean[time] = adc_read(time);
@@ -627,20 +627,33 @@ int main() {
                 adc_mean[time + 8] = adc_read(time + 8);
                 adc_mean[time + 8] = adc_read(time + 8);
                 uint index = (uint)(((3600 - adc_mean[time]) / 3600.0f) * (FREQUENCY_TABLE_LEN -1) );
-                if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
+                // if(time == 0)printf("Tone %d ADC: %04d setting %04d index: %04d \n", time, adc_mean[time], adc_mean[time + 8], index);
                 float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
                 base_freq_index[time] = get_frequency_index(freq);
                 // now = _millis();
                 if(time == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / 4095.0f), 1.0f, 5000.0f); envelope_recalc_all(); }
                 if(time == 9 - 8) { release_ms = logmap((adc_mean[9] / 4095.0f), 1.0f, 10000.0f);  envelope_recalc_all(); }
-                //if(time == 0)printf("Attack: %d ms, Release: %d ms\n", (unsigned)attack_ms, (unsigned)release_ms);
-                
-
-            // }
+                if(time == 10 - 8) { speed_tuning = adc_mean[10]/10; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning; }
+                if(time == 0) {printf("Attack: %d ms, Release: %d ms speed_tuning : %d \n",
+                    (unsigned)attack_ms,
+                    (unsigned)release_ms,
+                    speed_tuning); }
         }
         time++;
         if(time == 8) {
             time = 0;
+        }
+
+        if(last_note_change + speed_tuning < _millis()) {
+            gpio_put(leds_pins[sequence++], false);
+            if(sequence >= 8) sequence = 0;
+            last_note_change = _millis();
+            start_voice(sequence);
+            gpio_put(leds_pins[sequence], true);
+        }
+        if(last_note_change + attack_ms < _millis()) {
+            gpio_put(leds_pins[sequence], false);
+            release_voices_for_button(sequence);
         }
     }
     puts("\n");
