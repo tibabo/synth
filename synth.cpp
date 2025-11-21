@@ -123,17 +123,23 @@ int base_freq_index[8] = {24,24,24,24,24,24,24,24}; // note de base par bouton
 // Attack et Release en millisecondes (modifiables via clavier)
 static uint32_t attack_ms = 20;     // temps d'attaque par défaut
 static uint32_t release_ms = 200;   // temps de relâchement par défaut
+static uint32_t decay_ms   = 100;   // temps de decay (descente vers sustain)
+static uint32_t sustain_ms = 10; // durée sustain (0..65536)
+static uint32_t sustain_level = 48000; // niveau sustain (0..65536)
 static uint32_t speed_tuning = 500; // temps entre 2 notes
 static uint32_t sequence = 0; // index de la note en cours dans la sequence
 
-enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_SUSTAIN, ENV_RELEASE };
+enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 struct Envelope {
     EnvState state;
     uint32_t pos;            // position dans la phase courante (samples)
     uint32_t attack_samples; // durée d'attaque en samples
+    uint32_t decay_samples;  // durée de decay en samples
+    uint32_t sustain_samples; // durée de sustain en samples
     uint32_t release_samples;// durée de release en samples
     uint32_t level;          // niveau courant 0..65536
     uint32_t release_start_level; // niveau de départ pour la phase de release
+    uint32_t sustain_target; // niveau cible pour sustain (copie de sustain_level)
 };
 
 // Collection dynamique de voix (remplace le tableau env[])
@@ -161,9 +167,11 @@ static inline uint32_t _millis(void)
 
 static inline void envelope_recalc(Envelope &e) {
     e.attack_samples  = (attack_ms  * audio_format.sample_freq) / 1000;
+    e.decay_samples   = (decay_ms   * audio_format.sample_freq) / 1000;
     e.release_samples = (release_ms * audio_format.sample_freq) / 1000;
+    e.sustain_samples = (sustain_ms * audio_format.sample_freq) / 1000;
     if (e.state == ENV_ATTACK && e.attack_samples == 0) {
-        e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0;
+        e.level = 65536; e.state = (e.decay_samples ? ENV_DECAY : ENV_SUSTAIN); e.pos = 0;
     }
     if (e.state == ENV_RELEASE && e.release_samples == 0) {
         e.level = 0; e.state = ENV_IDLE; e.pos = 0;
@@ -190,7 +198,7 @@ static void start_voice(int button_id) {
         }
     }
     Voice v; v.freq_index = base_freq_index[button_id]; v.position = 0; v.button_id = button_id;
-    v.env.state = ENV_ATTACK; v.env.pos = 0; v.env.level = 0; envelope_recalc(v.env);
+    v.env.state = ENV_ATTACK; v.env.pos = 0; v.env.level = 0; v.env.sustain_target = sustain_level; envelope_recalc(v.env);
     active_voices.push_back(v);
 }
 
@@ -221,8 +229,9 @@ static inline void envelope_step(Envelope &e) {
         case ENV_IDLE: e.level = 0; break;
         case ENV_ATTACK:
             if (e.attack_samples == 0) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0; break; }
-            if (e.pos >= e.attack_samples) { e.level = 65536; e.state = ENV_SUSTAIN; e.pos = 0;
-                printf("Attack complete %u\n",_millis() - start_time); break; }
+            if (e.pos >= e.attack_samples) { e.level = 65536; e.state = (e.decay_samples ? ENV_DECAY : ENV_SUSTAIN); e.pos = 0;
+                //printf("Attack complete %u\n",_millis() - start_time); 
+                break; }
             if (use_log_curve) {
                 float t = (float)e.pos / (float)e.attack_samples; // 0..1
                 // Approximation rationnelle douce (évite logf/powf coûteux):
@@ -236,8 +245,26 @@ static inline void envelope_step(Envelope &e) {
             }
             ++e.pos;
             break;
+        case ENV_DECAY:
+            if (e.decay_samples == 0) { e.state = ENV_SUSTAIN; e.pos = 0; e.level = e.sustain_target; break; }
+            if (e.pos >= e.decay_samples) { e.level = e.sustain_target; e.state = ENV_SUSTAIN; e.pos = 0; break; }
+            if (use_log_curve) {
+                float t = (float)e.pos / (float)e.decay_samples; // 0..1
+                float k = curve_factor;
+                float denom = t + k * (1.0f - t);
+                float shaped_up = (denom > 0.0f) ? (t / denom) : t; // 0..1 increasing
+                float shaped_down = 1.0f - shaped_up; // 1 -> 0
+                float span = (float)(65536 - e.sustain_target);
+                e.level = (uint32_t)(e.sustain_target + shaped_down * span);
+            } else {
+                uint64_t span = 65536 - e.sustain_target;
+                e.level = (uint32_t)(e.sustain_target + (span * (uint64_t)(e.decay_samples - e.pos)) / e.decay_samples);
+            }
+            ++e.pos;
+            break;
         case ENV_SUSTAIN:
-            e.level = 65536;
+            if (e.pos >= e.sustain_samples) { e.state = ENV_RELEASE; e.pos = 0; break; }
+            ++e.pos;
             break;
         case ENV_RELEASE:
             if (e.release_samples == 0) { e.level = 0; e.state = ENV_IDLE; e.pos = 0; break; }
@@ -574,8 +601,14 @@ int main() {
             // Réglages Attack / Release
             if (c == 't' && attack_ms > 0) { attack_ms -= (attack_ms > 10 ? 10 : 1); envelope_recalc_all(); }
             if (c == 'T' && attack_ms < 5000) { attack_ms += (attack_ms >= 1000 ? 100 : 10); envelope_recalc_all(); }
+            // Réglages Decay
+            if (c == 'd' && decay_ms > 0) { decay_ms -= (decay_ms > 10 ? 10 : 1); envelope_recalc_all(); }
+            if (c == 'D' && decay_ms < 5000) { decay_ms += (decay_ms >= 1000 ? 100 : 10); envelope_recalc_all(); }
             if (c == 'r' && release_ms > 0) { release_ms -= (release_ms > 10 ? 10 : 1); envelope_recalc_all(); }
             if (c == 'R' && release_ms < 10000) { release_ms += (release_ms >= 1000 ? 100 : 10); envelope_recalc_all(); }
+            // Réglages Sustain level (u/U)
+            if (c == 'u' && sustain_level > 1000) { sustain_level -= 1000; if (sustain_level < 0) sustain_level = 0; envelope_recalc_all(); }
+            if (c == 'U' && sustain_level < 65536-1000) { sustain_level += 1000; if (sustain_level > 65536) sustain_level = 65536; envelope_recalc_all(); }
 
             // Réglage du facteur de courbure (logarithmique). Plus grand => attaque/release plus longue au début.
             if (c == 'f' && curve_factor > 1.1f) { curve_factor -= 0.5f; }
@@ -590,11 +623,13 @@ int main() {
             // Affichage des notes avec noms
          int octave0; const char* note0 = get_note_name(base_freq_index[current_button], &octave0);
          int active_cnt = 0; for(auto &vv : active_voices) if (vv.env.state != ENV_IDLE) ++active_cnt;
-         printf("BTN%d vol=%d actV=%d atk=%ums rel=%ums curve=%.1f log=%d gainShift=%d NOTE:%s%d      \r",
+         printf("BTN%d vol=%d actV=%d atk=%ums dec=%ums sus=%u rel=%ums curve=%.1f log=%d gainShift=%d NOTE:%s%d      \r",
              current_button+1,
              (int)vol,
              active_cnt,
              (unsigned)attack_ms,
+             (unsigned)decay_ms,
+             (unsigned)sustain_level,
              (unsigned)release_ms,
              curve_factor,
              use_log_curve ? 1 : 0,
@@ -621,7 +656,7 @@ int main() {
           
 
                 // time = 0;
-
+                sleep_ms(10);
                 adc_mean[time] = adc_read(time);
                 adc_mean[time] = adc_read(time); 
                 adc_mean[time + 8] = adc_read(time + 8);
@@ -631,11 +666,18 @@ int main() {
                 float freq = (frequency_table[index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
                 base_freq_index[time] = get_frequency_index(freq);
                 // now = _millis();
-                if(time == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / 4095.0f), 1.0f, 5000.0f); envelope_recalc_all(); }
-                if(time == 9 - 8) { release_ms = logmap((adc_mean[9] / 4095.0f), 1.0f, 10000.0f);  envelope_recalc_all(); }
-                if(time == 10 - 8) { speed_tuning = adc_mean[10]/10; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning; }
-                if(time == 0) {printf("Attack: %d ms, Release: %d ms speed_tuning : %d \n",
+                if(time == 8 - 8) { attack_ms  = logmap((adc_mean[ 8] / 4095.0f), 1.0f, 5000.0f);  }
+                if(time == 9 - 8) { decay_ms   = logmap((adc_mean[9] / 4095.0f),  1.0f, 3000.0f);   }
+                if(time == 10 - 8) { sustain_level = (uint32_t)logmap((adc_mean[10] / 4095.0f), 500.0f, 65536.0f);  }
+                if(time == 11 - 8) { sustain_ms = logmap((adc_mean[11] / 4095.0f),  1.0f, 3000.0f);   }
+                if(time == 12 - 8) { release_ms = logmap((adc_mean[12] / 4095.0f), 1.0f, 10000.0f);   }
+                if(time == 13 - 8) { speed_tuning = adc_mean[13]/10; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning; }
+
+                if(time == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms speed_tuning : %d \n",
                     (unsigned)attack_ms,
+                    (unsigned)decay_ms,
+                    (unsigned)sustain_level,
+                    (unsigned)sustain_ms,
                     (unsigned)release_ms,
                     speed_tuning); }
         }
@@ -651,10 +693,10 @@ int main() {
             start_voice(sequence);
             gpio_put(leds_pins[sequence], true);
         }
-        if(last_note_change + attack_ms < _millis()) {
-            gpio_put(leds_pins[sequence], false);
-            release_voices_for_button(sequence);
-        }
+        // if(last_note_change + attack_ms + decay_ms + sustain_ms < _millis()) {
+        //     gpio_put(leds_pins[sequence], false);
+        //     release_voices_for_button(sequence);
+        // }
     }
     puts("\n");
     return 0;
