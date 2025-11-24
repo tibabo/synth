@@ -39,6 +39,7 @@ extern "C" float fabsf(float);
 #include "pico/audio.h"
 #include "pico/audio_i2s.h"
 
+
 #define SINE_WAVE_TABLE_LEN 2048
 #define OCTAVES_COUNT 2             // Nombre d'octaves
 #define NOTES_PER_OCTAVE 12         // 12 demi-tons par octave
@@ -128,6 +129,9 @@ static uint32_t sustain_ms = 10; // durée sustain (0..65536)
 static uint32_t sustain_level = 48000; // niveau sustain (0..65536)
 static uint32_t speed_tuning = 500; // temps entre 2 notes
 static uint32_t sequence = 0; // index de la note en cours dans la sequence
+// Forme d'onde sélectionnable (sinus / carré / triangle)
+enum WaveformType { WAVE_SINE=0, WAVE_SQUARE=1, WAVE_TRIANGLE=2 };
+static int waveform_type = WAVE_SINE; // touche 'w' pour cycler
 
 enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 struct Envelope {
@@ -628,13 +632,16 @@ int main() {
             // Ajustement du gain global de sortie (post-mix) : g diminue, G augmente
             if (c == 'g' && output_gain_shift > 0) { output_gain_shift--; }
             if (c == 'G' && output_gain_shift < 12) { output_gain_shift++; }
-            
+            // Changer forme d'onde
+            if (c == 'w') { waveform_type = (waveform_type + 1) % 3; }
+            // (Drive retiré)
             if (c == 'q') break;
             
             // Affichage des notes avec noms
          int octave0; const char* note0 = get_note_name(base_freq_index[current_button], &octave0);
          int active_cnt = 0; for(auto &vv : active_voices) if (vv.env.state != ENV_IDLE) ++active_cnt;
-         printf("BTN%d vol=%d actV=%d atk=%ums dec=%ums sus=%u rel=%ums curve=%.1f log=%d gainShift=%d NOTE:%s%d      \r",
+         const char* wave_name = (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":"tri"));
+         printf("BTN%d vol=%d actV=%d atk=%ums dec=%ums sus=%u rel=%ums wave=%s curve=%.1f log=%d gainShift=%d NOTE:%s%d      \r",
              current_button+1,
              (int)vol,
              active_cnt,
@@ -642,6 +649,7 @@ int main() {
              (unsigned)decay_ms,
              (unsigned)sustain_level,
              (unsigned)release_ms,
+             wave_name,
              curve_factor,
              use_log_curve ? 1 : 0,
              output_gain_shift,
@@ -695,13 +703,14 @@ int main() {
             if(scan_index == 11 - 8) { sustain_ms = logmap((adc_mean[11] / max_level),  20.0f, 500.0f);   }
             if(scan_index == 12 - 8) { release_ms = logmap((adc_mean[12] / max_level), 20.0f, 1000.0f);   }
             if(scan_index == 13 - 8) { speed_tuning = (max_level - adc_mean[13])/5; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning > 700 ? 3000000 : speed_tuning; }
-
-            if(scan_index == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms speed_tuning : %d \n",
+            if(scan_index == 14 - 8) { vol = (uint8_t)logmap((adc_mean[14] / max_level), 1.0f, 256.0f);  }
+            if(scan_index == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms Wave: %s speed_tuning : %d \n",
                 (unsigned)attack_ms,
                 (unsigned)decay_ms,
                 (unsigned)sustain_level,
                 (unsigned)sustain_ms,
                 (unsigned)release_ms,
+                (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":"tri")),
                 speed_tuning); }
         }
         scan_index++;
@@ -741,8 +750,22 @@ void decode()
                 continue;
             }
             uint32_t p = v.position;
-            int32_t raw = (vol * sine_wave_table[p >> 16u]);
-            // Appliquer compensation de gain par note (Q16)
+            uint32_t osc_index = p >> 16u;
+            int32_t base_wave;
+            if (waveform_type == WAVE_SINE) {
+                base_wave = sine_wave_table[osc_index];
+            } else if (waveform_type == WAVE_SQUARE) {
+                base_wave = (osc_index < SINE_WAVE_TABLE_LEN/2) ? 32767 : -32767;
+            } else { // WAVE_TRIANGLE
+                uint32_t half = SINE_WAVE_TABLE_LEN/2;
+                if (osc_index < half) {
+                    base_wave = -32767 + (int32_t)(( (int64_t)osc_index * 65534 ) / half);
+                } else {
+                    uint32_t idx2 = osc_index - half;
+                    base_wave = 32767 - (int32_t)(( (int64_t)idx2 * 65534 ) / half);
+                }
+            }
+            int32_t raw = vol * base_wave;
             uint32_t gq16 = frequency_gain_q16[v.freq_index];
             int32_t raw_g = (int32_t)(((int64_t)raw * gq16) >> 16);
             int32_t env_scaled = (int32_t)(((int64_t)raw_g * v.env.level) >> 16);
@@ -750,11 +773,8 @@ void decode()
             v.position += v.step();
             if (v.position >= pos_max) v.position -= pos_max;
         }
-        // Suppression du scaling dépendant du nombre de voix pour éviter le saut de gain lors du passage 2->1
-        // Soft clip rapide (compression) pour éviter saturation dure
-        // Limites approximatives pour conserver dynamique
-        const int32_t CLIP_THRESH = 0x3FFFFFFF; // marge sous INT32_MAX
-        int32_t value = (int32_t)mix; // déjà en plage 32-bit
+        const int32_t CLIP_THRESH = 0x3FFFFFFF;
+        int32_t value = (int32_t)mix;
         if (value > CLIP_THRESH) {
             int64_t x = value;
             // approximation douce: compresser au-delà du seuil
