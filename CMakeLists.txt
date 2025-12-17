@@ -41,7 +41,84 @@ add_subdirectory(pico_audio_i2s_32b pico_audio_i2s_32b)
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(synth synth.cpp )
+# ============================================================================
+# AUTOMATIC WAV SAMPLES DISCOVERY AND CODE GENERATION
+# Place .wav files in samples/ directory (supports subdirectories)
+# ============================================================================
+
+# Find all WAV files recursively in samples/
+file(GLOB_RECURSE SAMPLE_WAVS 
+    RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+    "${CMAKE_CURRENT_SOURCE_DIR}/samples/**/*.wav"
+    "${CMAKE_CURRENT_SOURCE_DIR}/samples/*.wav"
+)
+
+message(STATUS "Found ${CMAKE_CURRENT_SOURCE_DIR}/samples/ WAV files:")
+foreach(WAV ${SAMPLE_WAVS})
+    message(STATUS "  - ${WAV}")
+endforeach()
+
+# Generate C++ header with sample enum and accessors
+set(GENERATED_SAMPLES_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated_samples.h")
+add_custom_command(
+    OUTPUT ${GENERATED_SAMPLES_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E env python3 
+            ${CMAKE_CURRENT_SOURCE_DIR}/generate_samples.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/samples
+            ${GENERATED_SAMPLES_HEADER}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    DEPENDS ${SAMPLE_WAVS} ${CMAKE_CURRENT_SOURCE_DIR}/generate_samples.py
+    COMMENT "Generating samples header from samples/ directory"
+    VERBATIM
+)
+
+add_custom_target(generate_samples_header DEPENDS ${GENERATED_SAMPLES_HEADER})
+
+# Convert each WAV to binary object
+set(SAMPLE_OBJECTS "")
+set(SAMPLE_TARGETS "")
+
+foreach(WAV_REL ${SAMPLE_WAVS})
+    # Get path parts for naming
+    get_filename_component(WAV_NAME ${WAV_REL} NAME_WE)
+    get_filename_component(WAV_DIR ${WAV_REL} DIRECTORY)
+    
+    # Create safe object name
+    string(REPLACE "/" "_" OBJ_NAME "${WAV_REL}")
+    string(REPLACE ".wav" "" OBJ_NAME "${OBJ_NAME}")
+    string(REPLACE "-" "_" OBJ_NAME "${OBJ_NAME}")
+    string(REPLACE " " "_" OBJ_NAME "${OBJ_NAME}")
+    
+    set(SAMPLE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/${WAV_REL})
+    set(SAMPLE_OBJ ${CMAKE_CURRENT_BINARY_DIR}/${OBJ_NAME}_wav.o)
+    
+    # Create objcopy command
+    add_custom_command(
+        OUTPUT ${SAMPLE_OBJ}
+        COMMAND ${CMAKE_OBJCOPY} -I binary -O elf32-littlearm -B arm
+                --rename-section .data=.rodata,alloc,load,readonly,data,contents
+                ${SAMPLE_SRC} ${SAMPLE_OBJ}
+        DEPENDS ${SAMPLE_SRC}
+        COMMENT "Embedding ${WAV_REL} as flash object"
+        VERBATIM
+    )
+    
+    # Create target
+    add_custom_target(${OBJ_NAME}_blob_target DEPENDS ${SAMPLE_OBJ})
+    
+    # Accumulate
+    list(APPEND SAMPLE_OBJECTS ${SAMPLE_OBJ})
+    list(APPEND SAMPLE_TARGETS ${OBJ_NAME}_blob_target)
+endforeach()
+
+# Create main executable with all sample objects
+add_executable(synth synth.cpp ${SAMPLE_OBJECTS})
+
+# Add dependencies
+add_dependencies(synth generate_samples_header)
+if(SAMPLE_TARGETS)
+    add_dependencies(synth ${SAMPLE_TARGETS})
+endif()
 
 # Force higher optimization for this target (allow override by user build type)
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -69,6 +146,7 @@ target_link_libraries(synth
 # Add the standard include files to the build
 target_include_directories(synth PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}  # For generated_samples.h
 )
 
 # Add any user requested libraries

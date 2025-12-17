@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <vector>
 
+
 // Prototypes explicites pour calmer l'analyseur si les includes ne sont pas résolus
 extern "C" int printf(const char *format, ...);
 extern "C" int puts(const char *s);
@@ -38,6 +39,7 @@ extern "C" float fabsf(float);
 #include "pico/stdlib.h"
 #include "pico/audio.h"
 #include "pico/audio_i2s.h"
+#include "generated_samples.h"
 
 
 #define SINE_WAVE_TABLE_LEN 2048
@@ -130,8 +132,9 @@ static uint32_t sustain_level = 48000; // niveau sustain (0..65536)
 static uint32_t speed_tuning = 500; // temps entre 2 notes
 static uint32_t sequence = 0; // index de la note en cours dans la sequence
 // Forme d'onde sélectionnable (sinus / carré / triangle)
-enum WaveformType { WAVE_SINE=0, WAVE_SQUARE=1, WAVE_TRIANGLE=2 };
-static int waveform_type = WAVE_SINE; // touche 'w' pour cycler
+enum WaveformType { WAVE_SINE=0, WAVE_SQUARE=1, WAVE_TRIANGLE=2, WAVE_SAMPLE=3 };
+static int waveform_type = WAVE_SINE; // touche 'w' pour cycler (ajout SAMPLE)
+static int current_sample_id = 0;     // sample actif (index dans la banque)
 
 enum EnvState { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 struct Envelope {
@@ -157,9 +160,17 @@ struct Voice {
     uint32_t position;
     int button_id; // 0..7 si déclenché par bouton, -1 si via clavier
     Envelope env;
+    // Sample playback fields (utilisés si is_sample == true)
+    bool is_sample = false;
+    uint32_t sample_pos_q16 = 0;    // position en Q16 (index <<16)
+    uint32_t sample_inc_q16 = 0;    // incrément par frame (Q16)
+    const int16_t* sample_data = nullptr;  // pointeur vers PCM data
+    uint32_t sample_length = 0;            // longueur du sample
+    bool loop = false;
 };
-static std::vector<Voice> active_voices; // voix actives
 
+static std::vector<Voice> active_voices; // voix actives
+int last_note_change;
 // Facteur de courbure logarithmique (>1) : plus grand => attaque plus douce au début
 static float curve_factor = 9.0f; // utilisée dans log(1 + t*curve_factor)/log(1+curve_factor)
 static bool use_log_curve = true; // permet d'activer/désactiver le lissage log
@@ -188,7 +199,7 @@ float logmap(float x, float min, float max) {
 
 static inline void envelope_recalc_all() { for(auto &v : active_voices) envelope_recalc(v.env); }
 
-static void start_voice(int button_id) {
+static void start_voice(int button_id, SampleID sample_id = SampleID::COUNT) {
     if ((int)active_voices.size() >= MAX_VOICES) {
         // recycle voix en release ou idle si possible
         for (size_t i=0;i<active_voices.size();++i) {
@@ -203,6 +214,24 @@ static void start_voice(int button_id) {
     }
     Voice v; v.freq_index = base_freq_index[button_id]; v.position = 0; v.button_id = button_id;
     v.env.state = ENV_ATTACK; v.env.pos = 0; v.env.level = 0; v.env.sustain_target = sustain_level; envelope_recalc(v.env);
+    // Initialisation mode sample si forme sélectionnée
+    if (sample_id != SampleID::COUNT && get_sample_count() > 0) {
+        v.is_sample = true;
+        v.sample_pos_q16 = 0;
+        
+        // Récupérer infos du sample actif
+        const SampleInfo& info = get_sample_info(sample_id);
+        v.sample_data = info.data;
+        v.sample_length = info.length;
+        v.loop = strcmp(info.category, "LOOP") == 0;
+        printf("start sample %s , length : %u \n",info.name, info.length / 44100);
+        // Calcul de la fréquence voulue pour la voix
+        // float freq = (frequency_table[v.freq_index] * 44100.0f) / (0x10000 * SINE_WAVE_TABLE_LEN);
+        // float ratio = freq / info.root_freq;
+        // if (ratio < 0.01f) ratio = 0.01f; if (ratio > 32.0f) ratio = 32.0f; // limites de sécurité
+        // v.sample_inc_q16 = (uint32_t)(ratio * 65536.0f + 0.5f);
+        v.sample_inc_q16 = 1; // lecture à vitesse normale (1x)
+    }
     active_voices.push_back(v);
 }
 
@@ -500,6 +529,16 @@ uint16_t adc_read(int button) {
     return adc_read();
 }
 
+enum ModeButton {
+    MODE_BUTTON_BABOU = 0,
+    MODE_BUTTON_SEQUENCE = 1,
+    MODE_BUTTON_MAX = 2
+};
+
+int mode_button = MODE_BUTTON_BABOU;
+void update_sequencer(int scan_index);
+void update_babou_buttons(int scan_index);
+
 int main() {
 
     stdio_init_all();
@@ -590,9 +629,22 @@ int main() {
     }
 
     ap = i2s_audio_init(44100);
+    
+    // Affichage info samples embarqués
+    printf("\n=== Synth Init ===\n");
+    printf("Samples loaded: %d\n", get_sample_count());
+    for (int i = 0; i < get_sample_count(); ++i) {
+        const SampleInfo& info = get_sample_info(static_cast<SampleID>(i));
+        printf("  [%s] %s: %u frames (%.2fs) @ %.1fHz\n",
+               info.category, info.name, info.length,
+               (float)info.length / 44100.0f, info.root_freq);
+    }
+    printf("Flash storage: direct XIP access (no RAM copy)\n");
+    printf("Ready! 'w'=waveform 'x'=sample\n\n");
+    
     adc_select_input(0); // TONE_GPIO
     int scan_index = 0;
-    int sequence_pause_ms = 0;
+
     while (true) {
         int c = getchar_timeout_us(0);
         if (c >= 0 && c != PICO_ERROR_TIMEOUT) {
@@ -633,14 +685,20 @@ int main() {
             if (c == 'g' && output_gain_shift > 0) { output_gain_shift--; }
             if (c == 'G' && output_gain_shift < 12) { output_gain_shift++; }
             // Changer forme d'onde
-            if (c == 'w') { waveform_type = (waveform_type + 1) % 3; }
+            if (c == 'w') { waveform_type = (waveform_type + 1) % 4; }
+            // Changer sample
+            if (c == 'x' && get_sample_count() > 0) { 
+                current_sample_id = (current_sample_id + 1) % get_sample_count();
+                const SampleInfo& info = get_sample_info(static_cast<SampleID>(current_sample_id));
+                printf("Sample: [%s] %s\n", info.category, info.name);
+            }
             // (Drive retiré)
             if (c == 'q') break;
             
             // Affichage des notes avec noms
          int octave0; const char* note0 = get_note_name(base_freq_index[current_button], &octave0);
          int active_cnt = 0; for(auto &vv : active_voices) if (vv.env.state != ENV_IDLE) ++active_cnt;
-         const char* wave_name = (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":"tri"));
+         const char* wave_name = (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":(waveform_type==WAVE_TRIANGLE?"tri":"sam")));
          printf("BTN%d vol=%d actV=%d atk=%ums dec=%ums sus=%u rel=%ums wave=%s curve=%.1f log=%d gainShift=%d NOTE:%s%d      \r",
              current_button+1,
              (int)vol,
@@ -655,34 +713,11 @@ int main() {
              output_gain_shift,
              note0, octave0);
         } else {
-            static uint8_t prev_btn[8] = {1,1,1,1,1,1,1,1};
-            bool any_button_active = false;
-
-            for(int i=0;i<8;i++) {
-                int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
-                any_button_active |= (state == 0);
-                if(state == 0 && prev_btn[i] == 1) {
-                    // nouvelle voix sur ce bouton (superposition autorisée)
-                    start_voice(i);
-                    gpio_put(leds_pins[i], true);
-                    start_time = _millis();
-                    printf("Button %d pressed, starting voice at %u ms\n", i, start_time);
-                } else if (state == 1 && prev_btn[i] == 0) {
-                    // relâche toutes les voix de ce bouton
-                    release_voices_for_button(i);
-                    gpio_put(leds_pins[i], false);
-                }
-                prev_btn[i] = state;
-                int active_voices_count = voices_for_button(i);
-                if (active_voices_count > 0) {
-                    gpio_put(leds_pins[i], true);
-                } else {
-                    gpio_put(leds_pins[i], false);
-                }
+            if(mode_button == MODE_BUTTON_SEQUENCE) {
+                update_sequencer(scan_index);
             }
-            if(any_button_active == true) {
-                sequence_pause_ms = 1000;
-                last_note_change = _millis();
+            else {
+                update_babou_buttons(scan_index);
             }
 
                 // time = 0;
@@ -704,27 +739,21 @@ int main() {
             if(scan_index == 12 - 8) { release_ms = logmap((adc_mean[12] / max_level), 20.0f, 1000.0f);   }
             if(scan_index == 13 - 8) { speed_tuning = (max_level - adc_mean[13])/5; speed_tuning = speed_tuning < 50 ? 50 : speed_tuning > 700 ? 3000000 : speed_tuning; }
             if(scan_index == 14 - 8) { vol = (uint8_t)logmap((adc_mean[14] / max_level), 1.0f, 256.0f);  }
-            if(scan_index == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms Wave: %s speed_tuning : %d \n",
-                (unsigned)attack_ms,
-                (unsigned)decay_ms,
-                (unsigned)sustain_level,
-                (unsigned)sustain_ms,
-                (unsigned)release_ms,
-                (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":"tri")),
-                speed_tuning); }
+            // if(scan_index == 0) {printf("Attack: %d ms, Decay: %d ms Sustainlvl: %u sustain: %d ms Release: %d ms Wave: %s speed_tuning : %d \n",
+            //     (unsigned)attack_ms,
+            //     (unsigned)decay_ms,
+            //     (unsigned)sustain_level,
+            //     (unsigned)sustain_ms,
+            //     (unsigned)release_ms,
+            //     (waveform_type==WAVE_SINE?"sin":(waveform_type==WAVE_SQUARE?"car":(waveform_type==WAVE_TRIANGLE?"tri":"sam"))),
+            //     speed_tuning); }
+
         }
         scan_index++;
         if(scan_index == 8) {
             scan_index = 0;
         }
 
-        if(last_note_change + speed_tuning  + sequence_pause_ms < _millis()) {
-            last_note_change = _millis();
-            start_voice(sequence);
-            sequence_pause_ms = 0;
-            sequence++;
-            if(sequence >= 8) sequence = 0;
-        }
         // if(last_note_change + attack_ms + decay_ms + sustain_ms < _millis()) {
         //     gpio_put(leds_pins[sequence], false);
         //     release_voices_for_button(sequence);
@@ -732,6 +761,154 @@ int main() {
     }
     puts("\n");
     return 0;
+}
+
+void update_sequencer(int scan_index) {
+
+
+    static int sequence_pause_ms = 0;
+    static uint8_t prev_btn[8] = {1,1,1,1,1,1,1,1};
+    bool any_button_active = false;
+    for(int i=0;i<8;i++) {
+        int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
+        any_button_active |= (state == 0);
+        if(state == 0 && prev_btn[i] == 1) {
+            // nouvelle voix sur ce bouton (superposition autorisée)
+            start_voice(i);
+            gpio_put(leds_pins[i], true);
+            start_time = _millis();
+            printf("Button %d pressed, starting voice at %u ms\n", i, start_time);
+        } else if (state == 1 && prev_btn[i] == 0) {
+            // relâche toutes les voix de ce bouton
+            release_voices_for_button(i);
+            gpio_put(leds_pins[i], false);
+        }
+        prev_btn[i] = state;
+        int active_voices_count = voices_for_button(i);
+        if (active_voices_count > 0) {
+            gpio_put(leds_pins[i], true);
+        } else {
+            gpio_put(leds_pins[i], false);
+        }
+    }
+
+    if(any_button_active == true) {
+        sequence_pause_ms = 1000;
+        last_note_change = _millis();
+    }
+
+    if(last_note_change + speed_tuning  + sequence_pause_ms < _millis()) {
+        last_note_change = _millis();
+        start_voice(sequence);
+        sequence_pause_ms = 0;
+        sequence++;
+        if(sequence >= 8) sequence = 0;
+    }
+}
+
+int getSoundCountByCategory(const char* category) {
+
+    int count = 0;
+    for (int i = 0; i < get_sample_count(); ++i) {
+        const SampleInfo& info = get_sample_info(static_cast<SampleID>(i));
+        if (strcmp(info.category, category) == 0) {
+            count++;
+        }
+    }
+    printf("category %s %d",category,count);
+    return count;
+}
+int ratio_to_index(float ratio, const char* category) {
+    int count = getSoundCountByCategory(category);
+    ratio = ratio * count;
+    int idx = (int)ratio;
+    if(idx < 0) idx = 0;
+    if(idx >= count) idx = count -1;
+    return idx;
+}
+
+const char* category_names[8] = {
+    "CLOCHETTE",
+    "CHIEN",
+    "CHAT",
+    "RESSORT",
+    "HAHA",
+    "OH",
+    "DRUM",
+    "LOOP"
+};
+
+SampleID sample_id[8] = {
+    SampleID::BELL0,
+    SampleID::DOG0,
+    SampleID::CAT0,
+    SampleID::SPRING0,
+    SampleID::HAHA0,
+    SampleID::OH0,
+    SampleID::DRUM0,
+    SampleID::LOOP0
+};
+
+bool button_init[8] = {false,false,false,false,false,false,false,false};
+
+void update_babou_buttons(int scan_index) {
+    float max_level = 3600.f;
+    if(scan_index == 14 - 8) { vol = (uint8_t)logmap((adc_mean[14] / max_level), 1.0f, 256.0f);  }
+    float ratio = ((3600 - adc_mean[scan_index]) / 3600.0f);
+    static int soundIdx[8] = {0,0,0,0,0,0,0,0};
+    int new_index = ratio_to_index(ratio, category_names[scan_index]);
+    if(button_init[scan_index] == false) {
+        // just for initialization, no sound trigger
+        soundIdx[scan_index] = new_index;
+        button_init[scan_index] = true;
+    } else {
+        if(new_index != soundIdx[scan_index]) {
+            soundIdx[scan_index] = new_index;
+            if(scan_index !=7) {
+                start_voice(scan_index, static_cast<SampleID>((int)sample_id[scan_index] + soundIdx[scan_index]));
+            }
+        }
+    }
+
+
+
+    static uint8_t prev_btn[8] = {1,1,1,1,1,1,1,1};
+    bool any_button_active = false;
+    for(int i=0;i<8;i++) {
+        int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
+        any_button_active |= (state == 0);
+        if(state == 0 && prev_btn[i] == 1) {
+            if(i !=7) {
+                start_voice(i, static_cast<SampleID>((int)sample_id[i] + soundIdx[i]));
+                printf("start button %d sample %d + %d\n",i, (int)sample_id[i], soundIdx[i]);
+            }
+            else {
+                int active_voices_count = voices_for_button(i);
+                if(active_voices_count > 0) {
+                    // stop all
+                    for (int idx = (int)active_voices.size()-1; idx >= 0; --idx) {
+                        Voice &v = active_voices[idx];
+                        if (v.button_id == i) {
+                            active_voices.erase(active_voices.begin()+idx);
+                            break;
+                        }
+                    }
+                } else {
+                    static int loop_idx = 0;
+                    start_voice(i, static_cast<SampleID>((int)SampleID::LOOP0 + loop_idx));
+                    loop_idx++;
+                    if(loop_idx > 2) loop_idx = 0;
+                }
+            }
+        }
+        prev_btn[i] = state;
+        int active_voices_count = voices_for_button(i);
+        if (active_voices_count > 0) {
+            gpio_put(leds_pins[i], true);
+        } else {
+            gpio_put(leds_pins[i], false);
+        }
+    }
 }
 
 void decode()
@@ -744,34 +921,59 @@ void decode()
         // Itération arrière pour permettre effacement des voix terminées
         for(int idx = (int)active_voices.size()-1; idx >= 0; --idx) {
             Voice &v = active_voices[idx];
-            envelope_step(v.env);
-            if (v.env.state == ENV_IDLE) {
-                active_voices.erase(active_voices.begin()+idx);
-                continue;
-            }
-            uint32_t p = v.position;
-            uint32_t osc_index = p >> 16u;
+
             int32_t base_wave;
-            if (waveform_type == WAVE_SINE) {
-                base_wave = sine_wave_table[osc_index];
-            } else if (waveform_type == WAVE_SQUARE) {
-                base_wave = (osc_index < SINE_WAVE_TABLE_LEN/2) ? 32767 : -32767;
-            } else { // WAVE_TRIANGLE
-                uint32_t half = SINE_WAVE_TABLE_LEN/2;
-                if (osc_index < half) {
-                    base_wave = -32767 + (int32_t)(( (int64_t)osc_index * 65534 ) / half);
-                } else {
-                    uint32_t idx2 = osc_index - half;
-                    base_wave = 32767 - (int32_t)(( (int64_t)idx2 * 65534 ) / half);
+            if (v.is_sample) {
+                uint32_t sidx = v.sample_pos_q16;
+                if (sidx >= v.sample_length) {
+                    if(v.loop) {
+                        // Reboucler
+                        v.sample_pos_q16 = 0;
+                        sidx = 0;
+                    } else {
+                        // Fin du sample => terminer la voix
+                        v.env.state = ENV_IDLE;
+                        active_voices.erase(active_voices.begin()+idx);
+                        continue;
+                    }
                 }
+                base_wave = v.sample_data[sidx];
+                v.sample_pos_q16 += v.sample_inc_q16;
+            } else {
+                envelope_step(v.env);
+                if (v.env.state == ENV_IDLE) {
+                    active_voices.erase(active_voices.begin()+idx);
+                    continue;
+                }
+                uint32_t p = v.position;
+                uint32_t osc_index = p >> 16u;
+                if (waveform_type == WAVE_SINE) {
+                    base_wave = sine_wave_table[osc_index];
+                } else if (waveform_type == WAVE_SQUARE) {
+                    base_wave = (osc_index < SINE_WAVE_TABLE_LEN/2) ? 32767 : -32767;
+                } else if (waveform_type == WAVE_TRIANGLE) {
+                    uint32_t half = SINE_WAVE_TABLE_LEN/2;
+                    if (osc_index < half) {
+                        base_wave = -32767 + (int32_t)(((int64_t)osc_index * 65534) / half);
+                    } else {
+                        uint32_t idx2 = osc_index - half;
+                        base_wave = 32767 - (int32_t)(((int64_t)idx2 * 65534) / half);
+                    }
+                } else { // fallback
+                    base_wave = 0;
+                }
+                v.position += v.step();
+                if (v.position >= pos_max) v.position -= pos_max;
             }
             int32_t raw = vol * base_wave;
-            uint32_t gq16 = frequency_gain_q16[v.freq_index];
-            int32_t raw_g = (int32_t)(((int64_t)raw * gq16) >> 16);
-            int32_t env_scaled = (int32_t)(((int64_t)raw_g * v.env.level) >> 16);
-            mix += env_scaled;
-            v.position += v.step();
-            if (v.position >= pos_max) v.position -= pos_max;
+            if(v.is_sample) {
+                mix += raw; // les samples sont supposés déjà mixés/normés
+            } else {
+                uint32_t gq16 = frequency_gain_q16[v.freq_index];
+                int32_t raw_g = (int32_t)(((int64_t)raw * gq16) >> 16);
+                int32_t env_scaled = (int32_t)(((int64_t)raw_g * v.env.level) >> 16);
+                mix += env_scaled;
+            }
         }
         const int32_t CLIP_THRESH = 0x3FFFFFFF;
         int32_t value = (int32_t)mix;
