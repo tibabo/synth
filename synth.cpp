@@ -9,7 +9,15 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <vector>
-
+#include "hardware/pll.h"
+#include "hardware/clocks.h"
+#include "hardware/structs/clocks.h"
+#include "hardware/pio.h"
+#include "hardware/adc.h"
+#include "pico/stdlib.h"
+#include "pico/audio.h"
+#include "pico/audio_i2s.h"
+#include "generated_samples.h"
 
 // Prototypes explicites pour calmer l'analyseur si les includes ne sont pas résolus
 extern "C" int printf(const char *format, ...);
@@ -18,7 +26,8 @@ extern "C" void free(void *ptr);
 extern "C" float powf(float, float);
 extern "C" float cosf(float);
 extern "C" float fabsf(float);
-
+audio_buffer_pool_t *i2s_audio_init(uint32_t sample_freq);
+void i2s_audio_deinit();
 // Assurer disponibilité des fonctions/f constantes math si certains define manquent
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -31,15 +40,7 @@ extern "C" float fabsf(float);
 #error Ce fichier nécessite un compilateur C++ pour les surcharges.
 #endif
 
-#include "hardware/pll.h"
-#include "hardware/clocks.h"
-#include "hardware/structs/clocks.h"
-#include "hardware/pio.h"
-#include "hardware/adc.h"
-#include "pico/stdlib.h"
-#include "pico/audio.h"
-#include "pico/audio_i2s.h"
-#include "generated_samples.h"
+
 
 
 #define SINE_WAVE_TABLE_LEN 2048
@@ -174,6 +175,69 @@ int last_note_change;
 // Facteur de courbure logarithmique (>1) : plus grand => attaque plus douce au début
 static float curve_factor = 9.0f; // utilisée dans log(1 + t*curve_factor)/log(1+curve_factor)
 static bool use_log_curve = true; // permet d'activer/désactiver le lissage log
+
+// --- Gestion veille ---
+static uint32_t last_button_activity_ms = 0; // dernier appui détecté
+static bool in_sleep_mode = false;
+
+static inline bool any_button_is_pressed() {
+    for (int i = 0; i < 8; ++i) {
+        if (gpio_get(buttons_pins[i]) == 0) return true; // actif bas
+    }
+    return false;
+}
+
+static void enter_idle_sleep_mode() {
+    if (in_sleep_mode) return;
+    in_sleep_mode = true;
+    printf("\n[Sleep] Inactivité 2 min → veille.\n");
+
+    // Éteindre les LEDs
+    for (int i = 0; i < 8; ++i) gpio_put(leds_pins[i], false);
+
+    // Couper l'audio (DMA/PIO) pour économiser
+    if (ap) {
+        i2s_audio_deinit();
+    }
+
+    // Basculer l'alim en PFM (meilleur rendement) pendant la veille
+    gpio_put(PIN_DCDC_PSM_CTRL, 0);
+
+    // Réduire l'horloge système en basculant clk_sys sur clk_ref (xosc 12 MHz).
+    // Cela évite l'utilisation du PLL et supprime l'exigence d'un réglage "exact" non atteignable.
+    // clk_ref = xosc (12 MHz), clk_sys = clk_ref (12 MHz), clk_peri = clk_sys (12 MHz)
+    clock_configure(clk_ref,
+        CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC,
+        0,
+        12000000,
+        12000000);
+    clock_configure(clk_sys,
+        CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
+        0,
+        12000000,
+        12000000);
+    clock_configure(clk_peri,
+        0,
+        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+        12000000,
+        12000000);
+
+    // Attendre un appui sur n'importe quel bouton (actif bas)
+    while (!any_button_is_pressed()) {
+        sleep_ms(20);
+    }
+    // petit debounce
+    sleep_ms(50);
+
+    // Rétablir l'horloge et l'audio
+    set_sys_clock_khz(150000, true); // remonter l'horloge (~150 MHz) via PLL
+    gpio_put(PIN_DCDC_PSM_CTRL, 1);  // PWM: moins de bruit audio
+    ap = i2s_audio_init(44100);
+
+    last_button_activity_ms = to_ms_since_boot(get_absolute_time());
+    in_sleep_mode = false;
+    printf("[Sleep] Réveil par bouton.\n");
+}
 
 static inline uint32_t _millis(void)
 {
@@ -540,29 +604,6 @@ void update_sequencer(int scan_index);
 void update_babou_buttons(int scan_index);
 
 int main() {
-
-    stdio_init_all();
-
-    // Set PLL_USB 96MHz
-    pll_init(pll_usb, 1, 1536 * MHZ, 4, 4);
-    clock_configure(clk_usb,
-        0,
-        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-        96 * MHZ,
-        48 * MHZ);
-    // Change clk_sys to be 96MHz.
-    clock_configure(clk_sys,
-        CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLKSRC_CLK_SYS_AUX,
-        CLOCKS_CLK_SYS_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-        96 * MHZ,
-        96 * MHZ);
-    // CLK peri is clocked from clk_sys so need to change clk_peri's freq
-    clock_configure(clk_peri,
-        0,
-        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-        96 * MHZ,
-        96 * MHZ);
-    // Reinit uart now that clk_peri has changed
     stdio_init_all();
     adc_init();
     gpio_init(LED_PIN);
@@ -629,6 +670,9 @@ int main() {
     }
 
     ap = i2s_audio_init(44100);
+
+    // point de départ pour l'inactivité
+    last_button_activity_ms = to_ms_since_boot(get_absolute_time());
     
     // Affichage info samples embarqués
     printf("\n=== Synth Init ===\n");
@@ -754,6 +798,14 @@ int main() {
             scan_index = 0;
         }
 
+        // Vérifier l'inactivité (2 minutes sans appui bouton)
+        if (!in_sleep_mode) {
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (now_ms - last_button_activity_ms >= 120000) {
+                enter_idle_sleep_mode();
+            }
+        }
+
         // if(last_note_change + attack_ms + decay_ms + sustain_ms < _millis()) {
         //     gpio_put(leds_pins[sequence], false);
         //     release_voices_for_button(sequence);
@@ -774,6 +826,7 @@ void update_sequencer(int scan_index) {
         any_button_active |= (state == 0);
         if(state == 0 && prev_btn[i] == 1) {
             // nouvelle voix sur ce bouton (superposition autorisée)
+            last_button_activity_ms = to_ms_since_boot(get_absolute_time());
             start_voice(i);
             gpio_put(leds_pins[i], true);
             start_time = _millis();
@@ -815,7 +868,7 @@ int getSoundCountByCategory(const char* category) {
             count++;
         }
     }
-    printf("category %s %d",category,count);
+   // printf("category %s %d",category,count);
     return count;
 }
 int ratio_to_index(float ratio, const char* category) {
@@ -878,6 +931,7 @@ void update_babou_buttons(int scan_index) {
         int state = gpio_get(buttons_pins[i]); // 1 = relâché (pull-up), 0 = appuyé
         any_button_active |= (state == 0);
         if(state == 0 && prev_btn[i] == 1) {
+            last_button_activity_ms = to_ms_since_boot(get_absolute_time());
             if(i !=7) {
                 start_voice(i, static_cast<SampleID>((int)sample_id[i] + soundIdx[i]));
                 printf("start button %d sample %d + %d\n",i, (int)sample_id[i], soundIdx[i]);
